@@ -149,6 +149,7 @@ const schemaStatements = [
         vaccine_name VARCHAR(255) NULL,
         vaccination_date VARCHAR(50) NULL,
         next_due_date VARCHAR(50) NULL,
+        due_completed_at VARCHAR(50) NULL,
         notes TEXT NULL,
         deleted_at DATETIME NULL,
         synced TINYINT(1) DEFAULT 0,
@@ -164,13 +165,21 @@ const schemaStatements = [
     sql: `
       CREATE TABLE IF NOT EXISTS expenses (
         expense_id INT PRIMARY KEY,
-        batch_id INT NOT NULL,
+        farm_id INT NULL,
+        batch_id INT NULL,
         description VARCHAR(255) NULL,
         amount DECIMAL(12, 2) NULL,
         expense_date VARCHAR(50) NULL,
+        expense_scope VARCHAR(20) DEFAULT 'batch',
+        feed_type VARCHAR(100) NULL,
+        quantity_bought DECIMAL(12, 2) NULL,
         deleted_at DATETIME NULL,
         synced TINYINT(1) DEFAULT 0,
+        INDEX idx_expenses_farm_id (farm_id),
         INDEX idx_expenses_batch_id (batch_id),
+        CONSTRAINT fk_expenses_farm
+          FOREIGN KEY (farm_id) REFERENCES farms(farm_id)
+          ON DELETE CASCADE,
         CONSTRAINT fk_expenses_batch
           FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
           ON DELETE CASCADE
@@ -237,12 +246,12 @@ const backupConfigs = {
   'vaccination-records': {
     tableName: 'vaccination_records',
     idColumn: 'vaccination_id',
-    columns: ['vaccination_id', 'batch_id', 'vaccine_name', 'vaccination_date', 'next_due_date', 'notes', 'deleted_at'],
+    columns: ['vaccination_id', 'batch_id', 'vaccine_name', 'vaccination_date', 'next_due_date', 'due_completed_at', 'notes', 'deleted_at'],
   },
   expenses: {
     tableName: 'expenses',
     idColumn: 'expense_id',
-    columns: ['expense_id', 'batch_id', 'description', 'amount', 'expense_date', 'deleted_at'],
+    columns: ['expense_id', 'farm_id', 'batch_id', 'description', 'amount', 'expense_date', 'expense_scope', 'feed_type', 'quantity_bought', 'deleted_at'],
   },
   sales: {
     tableName: 'sales',
@@ -275,6 +284,13 @@ const initializeSchema = async () => {
   for (const tableName of softDeleteTables) {
     await ensureColumnExists(tableName, 'deleted_at', 'DATETIME NULL');
   }
+
+  await ensureColumnExists('expenses', 'farm_id', 'INT NULL');
+  await ensureColumnExists('expenses', 'expense_scope', `VARCHAR(20) DEFAULT 'batch'`);
+  await ensureColumnExists('expenses', 'feed_type', 'VARCHAR(100) NULL');
+  await ensureColumnExists('expenses', 'quantity_bought', 'DECIMAL(12, 2) NULL');
+  await ensureColumnExists('vaccination_records', 'due_completed_at', 'VARCHAR(50) NULL');
+  await dbQuery('ALTER TABLE expenses MODIFY COLUMN batch_id INT NULL');
 };
 
 const getNextPrimaryKey = async (tableName, idColumn) => {
@@ -326,6 +342,16 @@ const getBootstrapPayloadForUser = async user => {
   );
 
   const farmIds = farms.map(item => item.farm_id);
+  const farmExpenses = farmIds.length
+    ? await dbQuery(
+      `SELECT expense_id, farm_id, batch_id, description, amount, expense_date, expense_scope, feed_type, quantity_bought, deleted_at
+       FROM expenses
+       WHERE farm_id IN (${farmIds.map(() => '?').join(', ')})
+         AND deleted_at IS NULL
+       ORDER BY expense_id`,
+      farmIds
+    )
+    : [];
 
   if (!farmIds.length) {
     return {
@@ -335,7 +361,7 @@ const getBootstrapPayloadForUser = async user => {
       feed_records: [],
       mortality_records: [],
       vaccination_records: [],
-      expenses: [],
+      expenses: farmExpenses,
       sales: [],
     };
   }
@@ -360,7 +386,7 @@ const getBootstrapPayloadForUser = async user => {
       feed_records: [],
       mortality_records: [],
       vaccination_records: [],
-      expenses: [],
+      expenses: farmExpenses,
       sales: [],
     };
   }
@@ -390,7 +416,7 @@ const getBootstrapPayloadForUser = async user => {
       batchIds
     ),
     dbQuery(
-      `SELECT vaccination_id, batch_id, vaccine_name, vaccination_date, next_due_date, notes, deleted_at
+      `SELECT vaccination_id, batch_id, vaccine_name, vaccination_date, next_due_date, due_completed_at, notes, deleted_at
        FROM vaccination_records
        WHERE batch_id IN (${batchPlaceholders})
          AND deleted_at IS NULL
@@ -398,12 +424,15 @@ const getBootstrapPayloadForUser = async user => {
       batchIds
     ),
     dbQuery(
-      `SELECT expense_id, batch_id, description, amount, expense_date, deleted_at
+      `SELECT expense_id, farm_id, batch_id, description, amount, expense_date, expense_scope, feed_type, quantity_bought, deleted_at
        FROM expenses
-       WHERE batch_id IN (${batchPlaceholders})
+       WHERE (
+         batch_id IN (${batchPlaceholders})
+         OR farm_id IN (${farmPlaceholders})
+       )
          AND deleted_at IS NULL
        ORDER BY expense_id`,
-      batchIds
+      [...batchIds, ...farmIds]
     ),
     dbQuery(
       `SELECT sale_id, batch_id, birds_sold, price_per_bird, total_revenue, sale_date, deleted_at
