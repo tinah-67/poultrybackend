@@ -30,6 +30,53 @@ const dbQuery = (sql, params = []) =>
 
 const normalizeEmail = value => String(value || '').trim().toLowerCase();
 
+const MYSQL_DATETIME_COLUMNS = new Set(['created_at', 'deleted_at']);
+
+const padDatePart = value => String(value).padStart(2, '0');
+
+const normalizeMySqlDateTime = value => {
+  if (value == null) {
+    return null;
+  }
+
+  const rawValue = String(value).trim();
+
+  if (!rawValue) {
+    return null;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(rawValue)) {
+    return rawValue;
+  }
+
+  const parsed = new Date(rawValue);
+
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return [
+    parsed.getFullYear(),
+    padDatePart(parsed.getMonth() + 1),
+    padDatePart(parsed.getDate()),
+  ].join('-') + ' ' + [
+    padDatePart(parsed.getHours()),
+    padDatePart(parsed.getMinutes()),
+    padDatePart(parsed.getSeconds()),
+  ].join(':');
+};
+
+const normalizeRecordDateTimes = (record, columns) =>
+  columns.reduce((nextRecord, column) => {
+    if (!MYSQL_DATETIME_COLUMNS.has(column)) {
+      nextRecord[column] = record[column];
+      return nextRecord;
+    }
+
+    nextRecord[column] = normalizeMySqlDateTime(record[column]);
+    return nextRecord;
+  }, {});
+
 const ensureColumnExists = async (tableName, columnName, definition) => {
   const existingColumns = await dbQuery(
     `SHOW COLUMNS FROM ${tableName} LIKE ?`,
@@ -56,6 +103,8 @@ const schemaStatements = [
         password VARCHAR(255) NOT NULL,
         role VARCHAR(50) NOT NULL,
         owner_user_id INT NULL,
+        recovery_question VARCHAR(255) NULL,
+        recovery_answer VARCHAR(255) NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         INDEX idx_users_owner_user_id (owner_user_id),
@@ -172,6 +221,7 @@ const schemaStatements = [
         expense_date VARCHAR(50) NULL,
         expense_scope VARCHAR(20) DEFAULT 'batch',
         feed_type VARCHAR(100) NULL,
+        vaccine_name VARCHAR(255) NULL,
         quantity_bought DECIMAL(12, 2) NULL,
         deleted_at DATETIME NULL,
         synced TINYINT(1) DEFAULT 0,
@@ -211,7 +261,7 @@ const backupConfigs = {
   users: {
     tableName: 'users',
     idColumn: 'user_id',
-    columns: ['user_id', 'first_name', 'last_name', 'email', 'password', 'role', 'owner_user_id', 'created_at'],
+    columns: ['user_id', 'first_name', 'last_name', 'email', 'password', 'role', 'owner_user_id', 'recovery_question', 'recovery_answer', 'created_at'],
     transformRecord: async record => ({
       user_id: record.user_id,
       first_name: record.first_name,
@@ -220,6 +270,8 @@ const backupConfigs = {
       password: await bcrypt.hash(String(record.password || ''), 10),
       role: record.role,
       owner_user_id: record.owner_user_id ?? null,
+      recovery_question: record.recovery_question ?? null,
+      recovery_answer: record.recovery_answer ?? null,
       created_at: record.created_at ?? null,
     }),
   },
@@ -251,7 +303,7 @@ const backupConfigs = {
   expenses: {
     tableName: 'expenses',
     idColumn: 'expense_id',
-    columns: ['expense_id', 'farm_id', 'batch_id', 'description', 'amount', 'expense_date', 'expense_scope', 'feed_type', 'quantity_bought', 'deleted_at'],
+    columns: ['expense_id', 'farm_id', 'batch_id', 'description', 'amount', 'expense_date', 'expense_scope', 'feed_type', 'vaccine_name', 'quantity_bought', 'deleted_at'],
   },
   sales: {
     tableName: 'sales',
@@ -285,9 +337,16 @@ const initializeSchema = async () => {
     await ensureColumnExists(tableName, 'deleted_at', 'DATETIME NULL');
   }
 
+  await ensureColumnExists('users', 'owner_user_id', 'INT NULL');
+  await ensureColumnExists('users', 'recovery_question', 'VARCHAR(255) NULL');
+  await ensureColumnExists('users', 'recovery_answer', 'VARCHAR(255) NULL');
+  await ensureColumnExists('farms', 'location', 'VARCHAR(255) NULL');
+  await ensureColumnExists('batches', 'purchase_cost', 'DECIMAL(12, 2) DEFAULT 0');
+  await ensureColumnExists('feed_records', 'feed_type', 'VARCHAR(100) NULL');
   await ensureColumnExists('expenses', 'farm_id', 'INT NULL');
   await ensureColumnExists('expenses', 'expense_scope', `VARCHAR(20) DEFAULT 'batch'`);
   await ensureColumnExists('expenses', 'feed_type', 'VARCHAR(100) NULL');
+  await ensureColumnExists('expenses', 'vaccine_name', 'VARCHAR(255) NULL');
   await ensureColumnExists('expenses', 'quantity_bought', 'DECIMAL(12, 2) NULL');
   await ensureColumnExists('vaccination_records', 'due_completed_at', 'VARCHAR(50) NULL');
   await dbQuery('ALTER TABLE expenses MODIFY COLUMN batch_id INT NULL');
@@ -321,7 +380,7 @@ const getBootstrapPayloadForUser = async user => {
   }
 
   const ownerRows = await dbQuery(
-    `SELECT user_id, first_name, last_name, email, role, owner_user_id, created_at
+    `SELECT user_id, first_name, last_name, email, role, owner_user_id, recovery_question, recovery_answer, created_at
      FROM users
      WHERE user_id = ?
      LIMIT 1`,
@@ -344,7 +403,7 @@ const getBootstrapPayloadForUser = async user => {
   const farmIds = farms.map(item => item.farm_id);
   const farmExpenses = farmIds.length
     ? await dbQuery(
-      `SELECT expense_id, farm_id, batch_id, description, amount, expense_date, expense_scope, feed_type, quantity_bought, deleted_at
+      `SELECT expense_id, farm_id, batch_id, description, amount, expense_date, expense_scope, feed_type, vaccine_name, quantity_bought, deleted_at
        FROM expenses
        WHERE farm_id IN (${farmIds.map(() => '?').join(', ')})
          AND deleted_at IS NULL
@@ -424,7 +483,7 @@ const getBootstrapPayloadForUser = async user => {
       batchIds
     ),
     dbQuery(
-      `SELECT expense_id, farm_id, batch_id, description, amount, expense_date, expense_scope, feed_type, quantity_bought, deleted_at
+      `SELECT expense_id, farm_id, batch_id, description, amount, expense_date, expense_scope, feed_type, vaccine_name, quantity_bought, deleted_at
        FROM expenses
        WHERE (
          batch_id IN (${batchPlaceholders})
@@ -472,7 +531,7 @@ const upsertRecords = config => {
           ? await config.transformRecord(inputRecord)
           : inputRecord;
 
-        preparedRecords.push(transformedRecord);
+        preparedRecords.push(normalizeRecordDateTimes(transformedRecord, config.columns));
       }
 
       const updateColumns = config.columns.filter(column => column !== config.idColumn);
@@ -522,7 +581,16 @@ app.get('/health', (_req, res) => {
 app.post('/users', async (req, res) => {
   console.log('Incoming request:', req.body);
 
-  const { first_name, last_name, email, password, role, owner_user_id = null } = req.body;
+  const {
+    first_name,
+    last_name,
+    email,
+    password,
+    role,
+    owner_user_id = null,
+    recovery_question = null,
+    recovery_answer = null,
+  } = req.body;
 
   if (!first_name || !last_name || !email || !password || !role) {
     return res.status(400).send({ success: false, message: 'Missing required fields' });
@@ -533,20 +601,32 @@ app.post('/users', async (req, res) => {
     const userId = req.body.user_id ?? await getNextPrimaryKey('users', 'user_id');
 
     const sql = `
-      INSERT INTO users (user_id, first_name, last_name, email, password, role, owner_user_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO users (user_id, first_name, last_name, email, password, role, owner_user_id, recovery_question, recovery_answer)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
       first_name = VALUES(first_name),
       last_name = VALUES(last_name),
       email = VALUES(email),
       password = VALUES(password),
       role = VALUES(role),
-      owner_user_id = VALUES(owner_user_id)
+      owner_user_id = VALUES(owner_user_id),
+      recovery_question = VALUES(recovery_question),
+      recovery_answer = VALUES(recovery_answer)
     `;
 
     db.query(
       sql,
-      [userId, first_name, last_name, normalizeEmail(email), hashedPassword, role, owner_user_id],
+      [
+        userId,
+        first_name,
+        last_name,
+        normalizeEmail(email),
+        hashedPassword,
+        role,
+        owner_user_id,
+        recovery_question,
+        recovery_answer,
+      ],
       err => {
         if (err) {
           console.log('Insert error:', err);
@@ -649,6 +729,8 @@ app.post('/bootstrap/login', async (req, res) => {
       email: user.email,
       role: user.role,
       owner_user_id: user.owner_user_id,
+      recovery_question: user.recovery_question,
+      recovery_answer: user.recovery_answer,
       created_at: user.created_at,
     };
 
