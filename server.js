@@ -242,14 +242,38 @@ const schemaStatements = [
       CREATE TABLE IF NOT EXISTS sales (
         sale_id INT PRIMARY KEY,
         batch_id INT NOT NULL,
-        birds_sold INT NULL,
-        price_per_bird DECIMAL(12, 2) NULL,
+        sale_type VARCHAR(20) DEFAULT 'birds',
+        quantity_sold INT NULL,
+        unit_price DECIMAL(12, 2) NULL,
         total_revenue DECIMAL(12, 2) NULL,
         sale_date VARCHAR(50) NULL,
         deleted_at DATETIME NULL,
         synced TINYINT(1) DEFAULT 0,
         INDEX idx_sales_batch_id (batch_id),
         CONSTRAINT fk_sales_batch
+          FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
+          ON DELETE CASCADE
+      )
+    `,
+  },
+  {
+    name: 'egg_collections',
+    sql: `
+      CREATE TABLE IF NOT EXISTS egg_collections (
+        egg_collection_id INT PRIMARY KEY,
+        batch_id INT NOT NULL,
+        collection_date VARCHAR(50) NULL,
+        eggs_collected INT NOT NULL,
+        eggs_sold INT DEFAULT 0,
+        eggs_broken INT DEFAULT 0,
+        eggs_household INT DEFAULT 0,
+        eggs_hatching INT DEFAULT 0,
+        sale_revenue DECIMAL(12, 2) DEFAULT 0,
+        notes TEXT NULL,
+        deleted_at DATETIME NULL,
+        synced TINYINT(1) DEFAULT 0,
+        INDEX idx_egg_collections_batch_id (batch_id),
+        CONSTRAINT fk_egg_collections_batch
           FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
           ON DELETE CASCADE
       )
@@ -308,7 +332,12 @@ const backupConfigs = {
   sales: {
     tableName: 'sales',
     idColumn: 'sale_id',
-    columns: ['sale_id', 'batch_id', 'birds_sold', 'price_per_bird', 'total_revenue', 'sale_date', 'deleted_at'],
+    columns: ['sale_id', 'batch_id', 'sale_type', 'quantity_sold', 'unit_price', 'total_revenue', 'sale_date', 'deleted_at'],
+  },
+  'egg-collections': {
+    tableName: 'egg_collections',
+    idColumn: 'egg_collection_id',
+    columns: ['egg_collection_id', 'batch_id', 'collection_date', 'eggs_collected', 'eggs_sold', 'eggs_broken', 'eggs_household', 'eggs_hatching', 'sale_revenue', 'notes', 'deleted_at'],
   },
 };
 
@@ -331,6 +360,7 @@ const initializeSchema = async () => {
     'vaccination_records',
     'expenses',
     'sales',
+    'egg_collections',
   ];
 
   for (const tableName of softDeleteTables) {
@@ -342,6 +372,9 @@ const initializeSchema = async () => {
   await ensureColumnExists('users', 'recovery_answer', 'VARCHAR(255) NULL');
   await ensureColumnExists('farms', 'location', 'VARCHAR(255) NULL');
   await ensureColumnExists('batches', 'purchase_cost', 'DECIMAL(12, 2) DEFAULT 0');
+  await ensureColumnExists('sales', 'sale_type', `VARCHAR(20) DEFAULT 'birds'`);
+  await ensureColumnExists('sales', 'quantity_sold', 'INT NULL');
+  await ensureColumnExists('sales', 'unit_price', 'DECIMAL(12, 2) NULL');
   await ensureColumnExists('feed_records', 'feed_type', 'VARCHAR(100) NULL');
   await ensureColumnExists('expenses', 'farm_id', 'INT NULL');
   await ensureColumnExists('expenses', 'expense_scope', `VARCHAR(20) DEFAULT 'batch'`);
@@ -350,6 +383,7 @@ const initializeSchema = async () => {
   await ensureColumnExists('expenses', 'quantity_bought', 'DECIMAL(12, 2) NULL');
   await ensureColumnExists('vaccination_records', 'due_completed_at', 'VARCHAR(50) NULL');
   await dbQuery('ALTER TABLE expenses MODIFY COLUMN batch_id INT NULL');
+  await migrateAndCompactSales();
 };
 
 const getNextPrimaryKey = async (tableName, idColumn) => {
@@ -358,6 +392,55 @@ const getNextPrimaryKey = async (tableName, idColumn) => {
   );
 
   return rows[0]?.nextId ?? 1;
+};
+
+// Copies legacy fields and egg rows, then removes the redundant storage.
+const migrateAndCompactSales = async () => {
+  const birdColumns = await dbQuery('SHOW COLUMNS FROM sales LIKE ?', ['birds_sold']);
+  if (birdColumns.length) {
+    await dbQuery(
+      `UPDATE sales
+       SET sale_type = COALESCE(NULLIF(sale_type, ''), 'birds'),
+           quantity_sold = COALESCE(quantity_sold, birds_sold),
+           unit_price = COALESCE(unit_price, price_per_bird)
+       WHERE quantity_sold IS NULL OR unit_price IS NULL OR sale_type IS NULL`
+    );
+  }
+
+  const legacyTables = await dbQuery('SHOW TABLES LIKE ?', ['egg_sales']);
+  if (legacyTables.length) {
+    const legacyEggSales = await dbQuery(
+      `SELECT egg_sale_id, batch_id, eggs_sold, price_per_egg, total_revenue, sale_date, deleted_at
+       FROM egg_sales`
+    );
+
+    for (const record of legacyEggSales) {
+      await dbQuery(
+        `INSERT IGNORE INTO sales (
+          sale_id, batch_id, sale_type, quantity_sold, unit_price,
+          total_revenue, sale_date, deleted_at, synced
+        ) VALUES (?, ?, 'eggs', ?, ?, ?, ?, ?, 1)`,
+        [
+          -Number(record.egg_sale_id),
+          record.batch_id,
+          record.eggs_sold,
+          record.price_per_egg,
+          record.total_revenue ?? Number(record.eggs_sold || 0) * Number(record.price_per_egg || 0),
+          record.sale_date,
+          record.deleted_at,
+        ]
+      );
+    }
+
+    await dbQuery('DROP TABLE egg_sales');
+  }
+
+  for (const columnName of ['birds_sold', 'price_per_bird', 'legacy_egg_sale_id']) {
+    const existingColumn = await dbQuery('SHOW COLUMNS FROM sales LIKE ?', [columnName]);
+    if (existingColumn.length) {
+      await dbQuery(`ALTER TABLE sales DROP COLUMN ${columnName}`);
+    }
+  }
 };
 
 const getAccessibleOwnerId = user =>
@@ -376,6 +459,7 @@ const getBootstrapPayloadForUser = async user => {
       vaccination_records: [],
       expenses: [],
       sales: [],
+      egg_collections: [],
     };
   }
 
@@ -422,6 +506,7 @@ const getBootstrapPayloadForUser = async user => {
       vaccination_records: [],
       expenses: farmExpenses,
       sales: [],
+      egg_collections: [],
     };
   }
 
@@ -447,6 +532,7 @@ const getBootstrapPayloadForUser = async user => {
       vaccination_records: [],
       expenses: farmExpenses,
       sales: [],
+      egg_collections: [],
     };
   }
 
@@ -457,6 +543,7 @@ const getBootstrapPayloadForUser = async user => {
     vaccinationRecords,
     expenses,
     sales,
+    eggCollections,
   ] = await Promise.all([
     dbQuery(
       `SELECT feed_id, batch_id, feed_type, feed_quantity, feed_cost, date_recorded, deleted_at
@@ -494,11 +581,19 @@ const getBootstrapPayloadForUser = async user => {
       [...batchIds, ...farmIds]
     ),
     dbQuery(
-      `SELECT sale_id, batch_id, birds_sold, price_per_bird, total_revenue, sale_date, deleted_at
+      `SELECT sale_id, batch_id, sale_type, quantity_sold, unit_price, total_revenue, sale_date, deleted_at
        FROM sales
        WHERE batch_id IN (${batchPlaceholders})
          AND deleted_at IS NULL
        ORDER BY sale_id`,
+      batchIds
+    ),
+    dbQuery(
+      `SELECT egg_collection_id, batch_id, collection_date, eggs_collected, eggs_sold, eggs_broken, eggs_household, eggs_hatching, sale_revenue, notes, deleted_at
+       FROM egg_collections
+       WHERE batch_id IN (${batchPlaceholders})
+         AND deleted_at IS NULL
+       ORDER BY egg_collection_id`,
       batchIds
     ),
   ]);
@@ -512,6 +607,7 @@ const getBootstrapPayloadForUser = async user => {
     vaccination_records: vaccinationRecords,
     expenses,
     sales,
+    egg_collections: eggCollections,
   };
 };
 
@@ -758,6 +854,7 @@ app.post('/backup/mortality-records', upsertRecords(backupConfigs['mortality-rec
 app.post('/backup/vaccination-records', upsertRecords(backupConfigs['vaccination-records']));
 app.post('/backup/expenses', upsertRecords(backupConfigs.expenses));
 app.post('/backup/sales', upsertRecords(backupConfigs.sales));
+app.post('/backup/egg-collections', upsertRecords(backupConfigs['egg-collections']));
 
 db.connect(async err => {
   if (err) {
@@ -769,11 +866,10 @@ db.connect(async err => {
 
   try {
     await initializeSchema();
+    app.listen(3000, () => {
+      console.log('Server running on port 3000');
+    });
   } catch (error) {
     console.log('Schema initialization stopped:', error);
   }
-});
-
-app.listen(3000, () => {
-  console.log('Server running on port 3000');
 });
