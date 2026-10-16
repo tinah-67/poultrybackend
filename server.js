@@ -279,6 +279,24 @@ const schemaStatements = [
       )
     `,
   },
+  {
+    name: 'egg_breakage_records',
+    sql: `
+      CREATE TABLE IF NOT EXISTS egg_breakage_records (
+        egg_breakage_id INT PRIMARY KEY,
+        batch_id INT NOT NULL,
+        breakage_date VARCHAR(50) NULL,
+        eggs_broken INT NOT NULL,
+        notes TEXT NULL,
+        deleted_at DATETIME NULL,
+        synced TINYINT(1) DEFAULT 0,
+        INDEX idx_egg_breakage_records_batch_id (batch_id),
+        CONSTRAINT fk_egg_breakage_records_batch
+          FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
+          ON DELETE CASCADE
+      )
+    `,
+  },
 ];
 
 const backupConfigs = {
@@ -339,6 +357,11 @@ const backupConfigs = {
     idColumn: 'egg_collection_id',
     columns: ['egg_collection_id', 'batch_id', 'collection_date', 'eggs_collected', 'eggs_sold', 'eggs_broken', 'eggs_household', 'eggs_hatching', 'sale_revenue', 'notes', 'deleted_at'],
   },
+  'egg-breakage-records': {
+    tableName: 'egg_breakage_records',
+    idColumn: 'egg_breakage_id',
+    columns: ['egg_breakage_id', 'batch_id', 'breakage_date', 'eggs_broken', 'notes', 'deleted_at'],
+  },
 };
 
 const initializeSchema = async () => {
@@ -361,6 +384,7 @@ const initializeSchema = async () => {
     'expenses',
     'sales',
     'egg_collections',
+    'egg_breakage_records',
   ];
 
   for (const tableName of softDeleteTables) {
@@ -460,6 +484,7 @@ const getBootstrapPayloadForUser = async user => {
       expenses: [],
       sales: [],
       egg_collections: [],
+      egg_breakage_records: [],
     };
   }
 
@@ -507,6 +532,7 @@ const getBootstrapPayloadForUser = async user => {
       expenses: farmExpenses,
       sales: [],
       egg_collections: [],
+      egg_breakage_records: [],
     };
   }
 
@@ -533,6 +559,7 @@ const getBootstrapPayloadForUser = async user => {
       expenses: farmExpenses,
       sales: [],
       egg_collections: [],
+      egg_breakage_records: [],
     };
   }
 
@@ -544,6 +571,7 @@ const getBootstrapPayloadForUser = async user => {
     expenses,
     sales,
     eggCollections,
+    eggBreakageRecords,
   ] = await Promise.all([
     dbQuery(
       `SELECT feed_id, batch_id, feed_type, feed_quantity, feed_cost, date_recorded, deleted_at
@@ -596,6 +624,14 @@ const getBootstrapPayloadForUser = async user => {
        ORDER BY egg_collection_id`,
       batchIds
     ),
+    dbQuery(
+      `SELECT egg_breakage_id, batch_id, breakage_date, eggs_broken, notes, deleted_at
+       FROM egg_breakage_records
+       WHERE batch_id IN (${batchPlaceholders})
+         AND deleted_at IS NULL
+       ORDER BY egg_breakage_id`,
+      batchIds
+    ),
   ]);
 
   return {
@@ -608,6 +644,7 @@ const getBootstrapPayloadForUser = async user => {
     expenses,
     sales,
     egg_collections: eggCollections,
+    egg_breakage_records: eggBreakageRecords,
   };
 };
 
@@ -855,6 +892,7 @@ app.post('/backup/vaccination-records', upsertRecords(backupConfigs['vaccination
 app.post('/backup/expenses', upsertRecords(backupConfigs.expenses));
 app.post('/backup/sales', upsertRecords(backupConfigs.sales));
 app.post('/backup/egg-collections', upsertRecords(backupConfigs['egg-collections']));
+app.post('/backup/egg-breakage-records', upsertRecords(backupConfigs['egg-breakage-records']));
 
 db.connect(async err => {
   if (err) {
